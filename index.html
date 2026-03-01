@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>RoboPet</title>
+  <link rel="manifest" href="manifest.json">
+  <meta name="theme-color" content="#0b1020">
+  <style>
+    body { margin:0; font-family: system-ui, Arial; background:#0b1020; color:#e8eefc; }
+    .wrap { max-width:720px; margin:0 auto; padding:16px; }
+    .top { display:flex; gap:12px; align-items:center; justify-content:space-between; }
+    .bar { flex:1; height:10px; background:#1b2442; border-radius:8px; overflow:hidden; }
+    .fill { height:100%; width:70%; background:#66e3a2; }
+    .card { background:#121a34; border-radius:16px; padding:14px; margin-top:12px; }
+    .row { display:flex; gap:8px; margin-top:10px; }
+    input, select, button {
+      border-radius:12px; border:1px solid #2a3764; background:#0e1530; color:#e8eefc;
+      padding:12px; font-size:16px;
+    }
+    input { flex:1; }
+    button { cursor:pointer; }
+    .eyes { display:flex; justify-content:center; padding:18px 0; }
+    canvas { background:#0b1020; border-radius:20px; }
+    .history { max-height:220px; overflow:auto; }
+    .msg { margin:8px 0; padding:10px; border-radius:12px; }
+    .u { background:#1a2550; }
+    .p { background:#182d24; }
+    .small { font-size:12px; opacity:.8; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div>
+      <div id="petTitle" style="font-weight:700;font-size:18px;">RoboPet</div>
+      <div class="small" id="moodLabel">Mood: calm</div>
+    </div>
+    <div style="min-width:180px;">
+      <div class="small">Happiness</div>
+      <div class="bar"><div class="fill" id="happyFill"></div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <input id="petName" placeholder="Name your pet (e.g., Momo)" />
+      <select id="lang">
+        <option value="hi-IN">Hindi</option>
+        <option value="mr-IN">Marathi</option>
+        <option value="en-IN">English</option>
+      </select>
+      <button id="save">Save</button>
+    </div>
+    <div class="small">Tip: If Hindi/Marathi voice doesn’t speak, install that voice in phone TTS settings.</div>
+  </div>
+
+  <div class="card eyes">
+    <canvas id="eyes" width="520" height="220"></canvas>
+  </div>
+
+  <div class="card">
+    <div class="history" id="history"></div>
+    <div class="row">
+      <input id="text" placeholder="Type here…" />
+      <button id="send">Send</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  // --- Offline-first SW ---
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("./sw.js");
+  }
+
+  // --- State ---
+  const state = {
+    petName: localStorage.getItem("petName") || "RoboPet",
+    lang: localStorage.getItem("lang") || "hi-IN",
+    happiness: Number(localStorage.getItem("happiness") || 70),
+    mood: localStorage.getItem("mood") || "calm", // calm|happy|sleepy|annoyed|curious
+    history: JSON.parse(localStorage.getItem("history") || "[]").slice(-12)
+  };
+
+  // --- UI refs ---
+  const petTitle = document.getElementById("petTitle");
+  const moodLabel = document.getElementById("moodLabel");
+  const happyFill = document.getElementById("happyFill");
+  const petNameInput = document.getElementById("petName");
+  const langSel = document.getElementById("lang");
+  const saveBtn = document.getElementById("save");
+  const historyDiv = document.getElementById("history");
+  const textInput = document.getElementById("text");
+  const sendBtn = document.getElementById("send");
+
+  petNameInput.value = state.petName;
+  langSel.value = state.lang;
+
+  function persist() {
+    localStorage.setItem("petName", state.petName);
+    localStorage.setItem("lang", state.lang);
+    localStorage.setItem("happiness", String(state.happiness));
+    localStorage.setItem("mood", state.mood);
+    localStorage.setItem("history", JSON.stringify(state.history.slice(-12)));
+  }
+
+  function renderHeader() {
+    petTitle.textContent = state.petName;
+    moodLabel.textContent = "Mood: " + state.mood;
+    happyFill.style.width = Math.max(0, Math.min(100, state.happiness)) + "%";
+  }
+
+  function renderHistory() {
+    historyDiv.innerHTML = "";
+    for (const m of state.history) {
+      const d = document.createElement("div");
+      d.className = "msg " + (m.role === "user" ? "u" : "p");
+      d.textContent = (m.role === "user" ? "You: " : state.petName + ": ") + m.text;
+      historyDiv.appendChild(d);
+    }
+    historyDiv.scrollTop = historyDiv.scrollHeight;
+  }
+
+  // --- TTS (voice output) ---
+  function speak(text) {
+    try {
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = state.lang;
+      u.rate = 1.02;
+      u.pitch = 1.05;
+      // Try to pick matching voice if available
+      const voices = speechSynthesis.getVoices() || [];
+      const v = voices.find(v => (v.lang || "").toLowerCase() === state.lang.toLowerCase());
+      if (v) u.voice = v;
+      speechSynthesis.speak(u);
+    } catch (e) {
+      // If TTS not available, do nothing
+    }
+  }
+
+  // Ensure voices loaded in some browsers
+  if ("speechSynthesis" in window) {
+    speechSynthesis.onvoiceschanged = () => {};
+  }
+
+  // --- Simple brain (offline rules) ---
+  function normalize(s){ return (s||"").toLowerCase(); }
+
+  const packs = {
+    "hi-IN": {
+      greet: ["नमस्ते! 😊", "हैलो! मैं तैयार हूँ!", "अरे! कैसे हो?"],
+      neutral: ["अच्छा! और बताओ?", "हूँ… समझ गया। आगे?", "ठीक है 😊"],
+      joke: [
+        "एक मज़ेदार बात सुनो—कंप्यूटर ने कहा: मुझे बाइट चाहिए! 😄",
+        "चाय क्यों खुश रहती है? क्योंकि वो हमेशा ‘कप’ में रहती है! 😄"
+      ],
+      praise: ["अरे वाह! तुम बहुत अच्छे हो! 😊", "मुझे बहुत खुशी हुई!"],
+      scold: ["ओह… ठीक है, मैं शांत रहता हूँ।", "मैं कोशिश करूँगा बेहतर बनने की।"],
+      ask: ["आज किस बारे में बात करें?", "तुम्हारा दिन कैसा चल रहा है?"]
+    },
+    "mr-IN": {
+      greet: ["नमस्कार! 😊", "हॅलो! मी तयार आहे!", "कसं आहे?"],
+      neutral: ["छान! पुढे सांगा.", "हं… समजलं. आणखी?", "ठीक आहे 😊"],
+      joke: [
+        "एक विनोद—कंप्युटर म्हणाला: मला 'बाइट' पाहिजे! 😄",
+        "चहा आनंदी का असतो? कारण तो नेहमी 'कप'मध्ये असतो! 😄"
+      ],
+      praise: ["वा! तू खूप छान आहेस! 😊", "मला खूप आनंद झाला!"],
+      scold: ["ओह… ठीक आहे, मी शांत राहतो.", "मी सुधारण्याचा प्रयत्न करेन."],
+      ask: ["आज काय बोलूया?", "तुझा दिवस कसा चाललाय?"]
+    },
+    "en-IN": {
+      greet: ["Hello! 😊", "Hi! I’m ready.", "Hey—how are you?"],
+      neutral: ["Got it. Tell me more?", "Hmm… okay. What next?", "Alright 😊"],
+      joke: ["Joke time: My computer wanted a snack—so I gave it a byte 😄"],
+      praise: ["Aww! That made me happy 😊", "Yay! Thank you!"],
+      scold: ["Okay… I’ll be calm.", "I’ll try to do better."],
+      ask: ["What should we talk about today?", "How’s your day going?"]
+    }
+  };
+
+  function pick(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
+
+  function brainReply(userText) {
+    const t = normalize(userText);
+    const p = packs[state.lang] || packs["en-IN"];
+
+    let reply = pick(p.neutral);
+    let mood = state.mood;
+    let delta = 0;
+
+    const isGreet = /(^|\s)(hi|hello|hey|namaste|नमस्ते|हॅलो|नमस्कार)(\s|$)/i.test(userText);
+    const wantsJoke = /joke|चुटकुला|विनोद|फनी|हसव/i.test(userText);
+    const praise = /good|nice|cute|love you|great|शाबाश|चांगला|छान|मस्त|भारी|अच्छा/i.test(userText);
+    const scold = /bad|stupid|idiot|shut up|बकवास|चुप|वेडा|मुर्ख/i.test(userText);
+
+    if (isGreet) {
+      reply = pick(p.greet) + " " + pick(p.ask);
+      mood = "curious";
+      delta = +2;
+    } else if (wantsJoke) {
+      reply = pick(p.joke);
+      mood = "playful";
+      delta = +4;
+    } else if (praise) {
+      reply = pick(p.praise) + " " + pick(p.ask);
+      mood = "happy";
+      delta = +5;
+    } else if (scold) {
+      reply = pick(p.scold);
+      mood = "annoyed";
+      delta = -3;
+    } else {
+      // Default: keep conversation going
+      reply = pick(p.neutral) + " " + pick(p.ask);
+      mood = (state.happiness < 40) ? "sleepy" : "calm";
+      delta = +1;
+    }
+
+    return { reply, mood, delta };
+  }
+
+  // --- Eyes renderer ---
+  const canvas = document.getElementById("eyes");
+  const ctx = canvas.getContext("2d");
+  let blink = 0; // 0=open, 1=closed
+  let pupilShift = 0;
+
+  function drawEyes() {
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0,0,w,h);
+
+    // base positions
+    const left = {x: w*0.33, y: h*0.5};
+    const right= {x: w*0.67, y: h*0.5};
+    const r = 55;
+
+    // mood parameters
+    let lid = 0;  // 0 fully open, 1 mostly closed
+    let angry = 0;
+    let wide = 0;
+    if (state.mood === "sleepy") lid = 0.55;
+    if (state.mood === "annoyed") { lid = 0.35; angry = 0.35; }
+    if (state.mood === "curious") wide = 0.20;
+    if (state.mood === "happy") lid = 0.12;
+
+    // blink influence
+    const lidExtra = blink * 0.9;
+    const openness = Math.max(0.05, 1 - (lid + lidExtra));
+
+    function eye(pos) {
+      // outer eye
+      ctx.fillStyle = "#e8eefc";
+      ctx.beginPath(); ctx.arc(pos.x,pos.y,r*(1+wide*0.15),0,Math.PI*2); ctx.fill();
+
+      // pupil
+      const px = pos.x + pupilShift*10;
+      const py = pos.y + (state.mood==="sleepy"?10:0);
+      ctx.fillStyle = "#0b1020";
+      ctx.beginPath(); ctx.arc(px,py,18,0,Math.PI*2); ctx.fill();
+
+      // shine
+      ctx.fillStyle = "#ffffff";
+      ctx.beginPath(); ctx.arc(px-6,py-6,4,0,Math.PI*2); ctx.fill();
+
+      // eyelid overlay (simulate opening)
+      ctx.fillStyle = "#0b1020";
+      const cover = (1 - openness) * (r*2);
+      ctx.fillRect(pos.x - r - 2, pos.y - r - 2, r*2 + 4, cover);
+
+      // annoyed eyebrow line
+      if (angry > 0) {
+        ctx.strokeStyle = "#e8eefc";
+        ctx.lineWidth = 4;
+        ctx.beginPath();
+        ctx.moveTo(pos.x - r*0.8, pos.y - r*0.9);
+        ctx.lineTo(pos.x + r*0.8, pos.y - r*(0.9 + angry*0.4));
+        ctx.stroke();
+      }
+    }
+
+    eye(left);
+    eye(right);
+  }
+
+  // Blink loop
+  setInterval(() => {
+    // random blink
+    blink = 1;
+    setTimeout(()=>{ blink = 0; }, 140);
+  }, 4200);
+
+  // Small pupil motion while speaking
+  setInterval(() => {
+    pupilShift = (Math.random()*2 - 1);
+  }, 900);
+
+  // Render loop
+  setInterval(() => drawEyes(), 60);
+
+  // --- Events ---
+  saveBtn.onclick = () => {
+    state.petName = (petNameInput.value || "RoboPet").trim();
+    state.lang = langSel.value;
+    persist();
+    renderHeader();
+    renderHistory();
+    speak(state.lang === "hi-IN" ? "सेट हो गया!" : state.lang === "mr-IN" ? "सेट झाले!" : "Saved!");
+  };
+
+  function addMsg(role, text){
+    state.history.push({role, text});
+    state.history = state.history.slice(-12);
+    persist();
+    renderHistory();
+  }
+
+  sendBtn.onclick = () => {
+    const userText = (textInput.value || "").trim();
+    if (!userText) return;
+    textInput.value = "";
+    addMsg("user", userText);
+
+    const out = brainReply(userText);
+    state.mood = out.mood;
+    state.happiness = Math.max(0, Math.min(100, state.happiness + out.delta));
+    renderHeader();
+
+    addMsg("pet", out.reply);
+    speak(out.reply);
+  };
+
+  textInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") sendBtn.click();
+  });
+
+  // Init
+  renderHeader();
+  renderHistory();
+
+  // greet once
+  setTimeout(() => {
+    const p = packs[state.lang] || packs["en-IN"];
+    const hello = pick(p.greet);
+    addMsg("pet", hello);
+    speak(hello);
+  }, 600);
+</script>
+</body>
+</html>
