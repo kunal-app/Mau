@@ -1,352 +1,421 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>RoboPet</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>Vector Eyes Pet</title>
   <link rel="manifest" href="manifest.json">
-  <meta name="theme-color" content="#0b1020">
+  <meta name="theme-color" content="#0b0f18" />
   <style>
-    body { margin:0; font-family: system-ui, Arial; background:#0b1020; color:#e8eefc; }
-    .wrap { max-width:720px; margin:0 auto; padding:16px; }
-    .top { display:flex; gap:12px; align-items:center; justify-content:space-between; }
-    .bar { flex:1; height:10px; background:#1b2442; border-radius:8px; overflow:hidden; }
-    .fill { height:100%; width:70%; background:#66e3a2; }
-    .card { background:#121a34; border-radius:16px; padding:14px; margin-top:12px; }
-    .row { display:flex; gap:8px; margin-top:10px; }
-    input, select, button {
-      border-radius:12px; border:1px solid #2a3764; background:#0e1530; color:#e8eefc;
-      padding:12px; font-size:16px;
+    html, body { height:100%; margin:0; background:#0b0f18; overflow:hidden; }
+    #stage { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+    canvas { width:min(92vw, 900px); height:auto; image-rendering: pixelated; }
+    #hud {
+      position:fixed; left:0; right:0; bottom:18px;
+      display:flex; justify-content:center; gap:14px; pointer-events:none;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
     }
-    input { flex:1; }
-    button { cursor:pointer; }
-    .eyes { display:flex; justify-content:center; padding:18px 0; }
-    canvas { background:#0b1020; border-radius:20px; }
-    .history { max-height:220px; overflow:auto; }
-    .msg { margin:8px 0; padding:10px; border-radius:12px; }
-    .u { background:#1a2550; }
-    .p { background:#182d24; }
-    .small { font-size:12px; opacity:.8; }
+    .btn {
+      pointer-events:auto;
+      width:64px; height:64px; border-radius:999px;
+      background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.18);
+      display:flex; align-items:center; justify-content:center;
+      color:#dbe7ff; font-size:26px; user-select:none;
+      backdrop-filter: blur(8px);
+    }
+    .btn:active { transform: scale(0.98); }
+    #dot {
+      position:fixed; top:16px; right:16px; width:12px; height:12px; border-radius:999px;
+      background:#3a4a6d; border:1px solid rgba(255,255,255,0.15);
+    }
+    /* state colors: idle / listening / thinking / speaking */
+    .idle { background:#3a4a6d; }
+    .listening { background:#46c2ff; }
+    .thinking { background:#f7c948; }
+    .speaking { background:#66e3a2; }
+    .error { background:#ff5c7a; }
   </style>
 </head>
 <body>
-<div class="wrap">
-  <div class="top">
-    <div>
-      <div id="petTitle" style="font-weight:700;font-size:18px;">RoboPet</div>
-      <div class="small" id="moodLabel">Mood: calm</div>
-    </div>
-    <div style="min-width:180px;">
-      <div class="small">Happiness</div>
-      <div class="bar"><div class="fill" id="happyFill"></div></div>
-    </div>
+  <div id="stage">
+    <canvas id="c" width="520" height="220" aria-label="Vector-style eyes"></canvas>
   </div>
 
-  <div class="card">
-    <div class="row">
-      <input id="petName" placeholder="Name your pet (e.g., Momo)" />
-      <select id="lang">
-        <option value="hi-IN">Hindi</option>
-        <option value="mr-IN">Marathi</option>
-        <option value="en-IN">English</option>
-      </select>
-      <button id="save">Save</button>
-    </div>
-    <div class="small">Tip: If Hindi/Marathi voice doesn’t speak, install that voice in phone TTS settings.</div>
-  </div>
+  <div id="dot" class="idle" title="status"></div>
 
-  <div class="card eyes">
-    <canvas id="eyes" width="520" height="220"></canvas>
+  <div id="hud">
+    <div class="btn" id="mic" title="Hold to talk">🎤</div>
+    <div class="btn" id="mute" title="Mute/unmute">🔊</div>
   </div>
-
-  <div class="card">
-    <div class="history" id="history"></div>
-    <div class="row">
-      <input id="text" placeholder="Type here…" />
-      <button id="send">Send</button>
-    </div>
-  </div>
-</div>
 
 <script>
-  // --- Offline-first SW ---
-  if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("./sw.js");
+/** ---------------------------
+ *  CONFIG
+ *  ---------------------------
+ *  1) Deploy backend (Cloudflare Worker) and set API_BASE to its URL.
+ *  2) This frontend is English-only by design.
+ */
+const API_BASE = "REPLACE_WITH_YOUR_WORKER_URL"; // e.g. https://your-worker.yourname.workers.dev
+
+/** ---------------------------
+ *  Service Worker (optional offline caching for UI only)
+ *  --------------------------- */
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("./sw.js");
+
+/** ---------------------------
+ *  Vector-ish Eye Renderer (pixel-ish rounded rectangles)
+ *  --------------------------- */
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+const dot = document.getElementById("dot");
+
+const state = {
+  status: "idle",          // idle|listening|thinking|speaking|error
+  baseMood: "calm",        // calm|sleepy|playful|bored
+  overlayEmotion: null,    // happy|curious|annoyed|surprised|sad|sleepy (short-lived)
+  overlayUntil: 0,
+
+  // internal drives (0..1)
+  energy: 0.78,
+  boredom: 0.10,
+
+  // animation signals
+  blink: 0,                // 0 open -> 1 closed
+  blinkTarget: 0,
+  blinkSpeed: 0.18,
+  pupilX: 0, pupilY: 0,    // -1..1
+  pupilTX: 0, pupilTY: 0,
+  pupilEase: 0.08,
+  pupilTimer: 0,
+
+  // speaking motion
+  speakPulse: 0
+};
+
+function setStatus(s) {
+  state.status = s;
+  dot.className = s;
+}
+
+function setOverlay(emotion, seconds=3) {
+  state.overlayEmotion = emotion;
+  state.overlayUntil = performance.now() + seconds * 1000;
+}
+
+/** Mood drift loop (feels alive even without chat) */
+setInterval(() => {
+  // slow drift
+  state.energy = clamp(state.energy - 0.003, 0.05, 1.0);
+  state.boredom = clamp(state.boredom + 0.004, 0.0, 1.0);
+
+  // choose base mood
+  if (state.energy < 0.28) state.baseMood = "sleepy";
+  else if (state.boredom > 0.75) state.baseMood = "bored";
+  else state.baseMood = "calm";
+
+  // occasional cute idle action
+  if (state.baseMood === "bored" && Math.random() < 0.35) {
+    setOverlay("curious", 2.0);
+    state.boredom = clamp(state.boredom - 0.25, 0, 1);
+  }
+}, 2500);
+
+/** Blink scheduler */
+setInterval(() => {
+  // Vector-like: irregular blink; sleepy = more/lower lids, playful = faster
+  let p = 0.85;
+  if (state.baseMood === "sleepy") p = 0.65;
+  if (state.baseMood === "bored") p = 0.75;
+
+  if (Math.random() < p) {
+    state.blinkTarget = 1;
+    setTimeout(() => state.blinkTarget = 0, 120 + Math.random()*80);
+    if (Math.random() < 0.18) { // occasional double blink
+      setTimeout(() => { state.blinkTarget = 1; setTimeout(()=>state.blinkTarget=0, 90); }, 240);
+    }
+  }
+}, 2800);
+
+/** Pupil saccades */
+setInterval(() => {
+  // if listening/thinking -> center attention
+  if (state.status === "listening" || state.status === "thinking") {
+    state.pupilTX = (Math.random()*0.2 - 0.1);
+    state.pupilTY = (Math.random()*0.2 - 0.1);
+    return;
+  }
+  // calm drift
+  const r = state.baseMood === "sleepy" ? 0.25 : 0.55;
+  state.pupilTX = (Math.random()*2 - 1) * r;
+  state.pupilTY = (Math.random()*2 - 1) * (r * 0.55);
+}, 900);
+
+/** Main render loop */
+function frame() {
+  const now = performance.now();
+
+  // overlay expiry
+  if (state.overlayEmotion && now > state.overlayUntil) state.overlayEmotion = null;
+
+  // animate blink
+  state.blink += (state.blinkTarget - state.blink) * state.blinkSpeed;
+
+  // animate pupil
+  state.pupilX += (state.pupilTX - state.pupilX) * state.pupilEase;
+  state.pupilY += (state.pupilTY - state.pupilY) * state.pupilEase;
+
+  // speaking pulse (tiny bounce)
+  state.speakPulse *= 0.92;
+
+  drawEyes();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+function drawEyes() {
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0,0,w,h);
+
+  // background (match body)
+  ctx.fillStyle = "#0b0f18";
+  ctx.fillRect(0,0,w,h);
+
+  // pick current “expression” parameters from base mood + overlay
+  const expr = computeExpression();
+
+  // two eyes positions
+  const L = {x: w*0.36, y: h*0.52};
+  const R = {x: w*0.64, y: h*0.52};
+
+  // draw eyes (Vector-ish: rounded rects)
+  drawEye(L, expr, true);
+  drawEye(R, expr, false);
+}
+
+function computeExpression() {
+  // defaults
+  let lid = 0.05;     // 0 open, 1 closed
+  let brow = 0.0;     // -1 sad, +1 angry tilt
+  let wide = 0.0;     // widen eyes
+  let pupil = 1.0;    // pupil size multiplier
+  let glow = 1.0;     // brightness
+
+  // base mood
+  if (state.baseMood === "sleepy") { lid = 0.55; pupil = 0.9; glow = 0.85; }
+  if (state.baseMood === "bored")  { lid = 0.25; pupil = 0.95; glow = 0.95; }
+
+  // status attention
+  if (state.status === "listening") { wide = 0.16; lid = Math.min(lid, 0.08); pupil = 1.1; }
+  if (state.status === "thinking")  { wide = 0.08; pupil = 1.05; glow = 1.05; }
+
+  // overlay emotion (short reaction)
+  switch (state.overlayEmotion) {
+    case "happy":      lid = Math.min(lid, 0.12); glow = 1.25; break;
+    case "curious":    wide = 0.22; pupil = 1.15; glow = 1.10; break;
+    case "annoyed":    lid = Math.max(lid, 0.28); brow = 0.55; glow = 0.95; break;
+    case "surprised":  wide = 0.30; lid = Math.min(lid, 0.02); pupil = 1.25; glow = 1.20; break;
+    case "sad":        lid = Math.max(lid, 0.22); brow = -0.35; glow = 0.85; break;
+    case "sleepy":     lid = Math.max(lid, 0.62); glow = 0.80; break;
   }
 
-  // --- State ---
-  const state = {
-    petName: localStorage.getItem("petName") || "RoboPet",
-    lang: localStorage.getItem("lang") || "hi-IN",
-    happiness: Number(localStorage.getItem("happiness") || 70),
-    mood: localStorage.getItem("mood") || "calm", // calm|happy|sleepy|annoyed|curious
-    history: JSON.parse(localStorage.getItem("history") || "[]").slice(-12)
+  // blink closure
+  lid = clamp(lid + state.blink * 0.95, 0, 0.98);
+
+  return { lid, brow, wide, pupil, glow };
+}
+
+function drawEye(pos, expr, isLeft) {
+  const eyeW = 128 + expr.wide * 18;
+  const eyeH = 92  + expr.wide * 12;
+  const radius = 18;
+
+  // speaking bounce
+  const bounce = state.speakPulse * 3;
+
+  // eye glow color (Vector-ish cyan)
+  const baseC = 210; // hue-ish via RGB mix (simple)
+  const bright = clamp(0.65 * expr.glow, 0.45, 0.95);
+
+  // outer eye shape
+  ctx.save();
+  ctx.translate(pos.x, pos.y + bounce);
+
+  // eye white/cyan fill
+  ctx.fillStyle = `rgba(90, 220, 255, ${bright})`;
+  roundRect(ctx, -eyeW/2, -eyeH/2, eyeW, eyeH, radius);
+  ctx.fill();
+
+  // pupil offset
+  const px = state.pupilX * 16 * (isLeft ? 1 : 1);
+  const py = state.pupilY * 10;
+
+  const pupilSize = 18 * expr.pupil;
+  ctx.fillStyle = "rgba(10, 16, 28, 0.95)";
+  roundRect(ctx, px - pupilSize/2, py - pupilSize/2, pupilSize, pupilSize, 6);
+  ctx.fill();
+
+  // tiny highlight
+  ctx.fillStyle = "rgba(255,255,255,0.65)";
+  roundRect(ctx, px - pupilSize*0.25, py - pupilSize*0.28, 5, 5, 2);
+  ctx.fill();
+
+  // eyelid cover from top
+  if (expr.lid > 0) {
+    const coverH = expr.lid * (eyeH + 10);
+    ctx.fillStyle = "#0b0f18";
+    ctx.fillRect(-eyeW/2 - 2, -eyeH/2 - 6, eyeW + 4, coverH);
+  }
+
+  // eyebrow line (annoyed/sad tilt)
+  if (Math.abs(expr.brow) > 0.05) {
+    ctx.strokeStyle = "rgba(220,240,255,0.75)";
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    const y = -eyeH/2 - 14;
+    const tilt = expr.brow * 10 * (isLeft ? 1 : -1);
+    ctx.moveTo(-eyeW/2 + 8, y + tilt);
+    ctx.lineTo( eyeW/2 - 8, y - tilt);
+    ctx.stroke();
+  }
+
+  ctx.restore();
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  const rr = Math.min(r, w/2, h/2);
+  ctx.beginPath();
+  ctx.moveTo(x+rr, y);
+  ctx.arcTo(x+w, y,   x+w, y+h, rr);
+  ctx.arcTo(x+w, y+h, x,   y+h, rr);
+  ctx.arcTo(x,   y+h, x,   y,   rr);
+  ctx.arcTo(x,   y,   x+w, y,   rr);
+  ctx.closePath();
+}
+
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+/** ---------------------------
+ *  Voice: browser STT (when available) + browser TTS
+ *  --------------------------- */
+let muted = false;
+
+document.getElementById("mute").addEventListener("click", () => {
+  muted = !muted;
+  document.getElementById("mute").textContent = muted ? "🔇" : "🔊";
+  if (muted) speechSynthesis.cancel();
+});
+
+function speak(text) {
+  if (muted) return;
+  try {
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = "en-US";
+    u.rate = 1.02;
+    u.pitch = 1.03;
+    u.onstart = () => { setStatus("speaking"); state.speakPulse = 1.0; setOverlay("happy", 1.4); };
+    u.onend   = () => { setStatus("idle"); };
+    speechSynthesis.speak(u);
+  } catch {
+    setStatus("idle");
+  }
+}
+
+/** Push-to-talk using Web Speech API (varies by device/browser).
+ *  If it fails, we fall back to a simple prompt input.
+ */
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec = null;
+if (SpeechRecognition) {
+  rec = new SpeechRecognition();
+  rec.lang = "en-US";
+  rec.interimResults = false;
+  rec.maxAlternatives = 1;
+
+  rec.onstart = () => { setStatus("listening"); setOverlay("curious", 2.0); };
+  rec.onerror = () => { setStatus("error"); setOverlay("sad", 2.0); setTimeout(()=>setStatus("idle"), 900); };
+  rec.onend = () => { if (state.status === "listening") setStatus("idle"); };
+
+  rec.onresult = async (e) => {
+    const text = e.results?.[0]?.[0]?.transcript?.trim();
+    if (!text) { setStatus("idle"); return; }
+    await handleUserText(text);
   };
+}
 
-  // --- UI refs ---
-  const petTitle = document.getElementById("petTitle");
-  const moodLabel = document.getElementById("moodLabel");
-  const happyFill = document.getElementById("happyFill");
-  const petNameInput = document.getElementById("petName");
-  const langSel = document.getElementById("lang");
-  const saveBtn = document.getElementById("save");
-  const historyDiv = document.getElementById("history");
-  const textInput = document.getElementById("text");
-  const sendBtn = document.getElementById("send");
+const micBtn = document.getElementById("mic");
+let holding = false;
 
-  petNameInput.value = state.petName;
-  langSel.value = state.lang;
-
-  function persist() {
-    localStorage.setItem("petName", state.petName);
-    localStorage.setItem("lang", state.lang);
-    localStorage.setItem("happiness", String(state.happiness));
-    localStorage.setItem("mood", state.mood);
-    localStorage.setItem("history", JSON.stringify(state.history.slice(-12)));
+micBtn.addEventListener("pointerdown", async () => {
+  holding = true;
+  if (rec) {
+    try { rec.start(); } catch {}
+  } else {
+    // fallback: type once
+    const typed = prompt("Type what you want to say (English):");
+    if (typed && typed.trim()) await handleUserText(typed.trim());
   }
+});
 
-  function renderHeader() {
-    petTitle.textContent = state.petName;
-    moodLabel.textContent = "Mood: " + state.mood;
-    happyFill.style.width = Math.max(0, Math.min(100, state.happiness)) + "%";
+micBtn.addEventListener("pointerup", () => {
+  holding = false;
+  if (rec) {
+    try { rec.stop(); } catch {}
   }
+});
 
-  function renderHistory() {
-    historyDiv.innerHTML = "";
-    for (const m of state.history) {
-      const d = document.createElement("div");
-      d.className = "msg " + (m.role === "user" ? "u" : "p");
-      d.textContent = (m.role === "user" ? "You: " : state.petName + ": ") + m.text;
-      historyDiv.appendChild(d);
+/** ---------------------------
+ *  Online AI Call (secure backend)
+ *  --------------------------- */
+async function handleUserText(userText) {
+  setStatus("thinking");
+  setOverlay("curious", 2.0);
+
+  try {
+    const r = await fetch(`${API_BASE}/api/respond`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        userText,
+        // tiny memory (keep minimal, eyes-only UI)
+        context: {
+          baseMood: state.baseMood,
+          energy: state.energy
+        }
+      })
+    });
+
+    if (!r.ok) throw new Error("bad response");
+    const data = await r.json();
+
+    // Expect: { text: "...", emotion: "happy|curious|annoyed|surprised|sad|sleepy", energyDelta?: number }
+    const text = (data.text || "").trim();
+    const emo = (data.emotion || "calm").toLowerCase();
+
+    if (data.energyDelta !== undefined) {
+      state.energy = clamp(state.energy + Number(data.energyDelta), 0.05, 1.0);
     }
-    historyDiv.scrollTop = historyDiv.scrollHeight;
-  }
 
-  // --- TTS (voice output) ---
-  function speak(text) {
-    try {
-      window.speechSynthesis.cancel();
-      const u = new SpeechSynthesisUtterance(text);
-      u.lang = state.lang;
-      u.rate = 1.02;
-      u.pitch = 1.05;
-      // Try to pick matching voice if available
-      const voices = speechSynthesis.getVoices() || [];
-      const v = voices.find(v => (v.lang || "").toLowerCase() === state.lang.toLowerCase());
-      if (v) u.voice = v;
-      speechSynthesis.speak(u);
-    } catch (e) {
-      // If TTS not available, do nothing
-    }
-  }
-
-  // Ensure voices loaded in some browsers
-  if ("speechSynthesis" in window) {
-    speechSynthesis.onvoiceschanged = () => {};
-  }
-
-  // --- Simple brain (offline rules) ---
-  function normalize(s){ return (s||"").toLowerCase(); }
-
-  const packs = {
-    "hi-IN": {
-      greet: ["नमस्ते! 😊", "हैलो! मैं तैयार हूँ!", "अरे! कैसे हो?"],
-      neutral: ["अच्छा! और बताओ?", "हूँ… समझ गया। आगे?", "ठीक है 😊"],
-      joke: [
-        "एक मज़ेदार बात सुनो—कंप्यूटर ने कहा: मुझे बाइट चाहिए! 😄",
-        "चाय क्यों खुश रहती है? क्योंकि वो हमेशा ‘कप’ में रहती है! 😄"
-      ],
-      praise: ["अरे वाह! तुम बहुत अच्छे हो! 😊", "मुझे बहुत खुशी हुई!"],
-      scold: ["ओह… ठीक है, मैं शांत रहता हूँ।", "मैं कोशिश करूँगा बेहतर बनने की।"],
-      ask: ["आज किस बारे में बात करें?", "तुम्हारा दिन कैसा चल रहा है?"]
-    },
-    "mr-IN": {
-      greet: ["नमस्कार! 😊", "हॅलो! मी तयार आहे!", "कसं आहे?"],
-      neutral: ["छान! पुढे सांगा.", "हं… समजलं. आणखी?", "ठीक आहे 😊"],
-      joke: [
-        "एक विनोद—कंप्युटर म्हणाला: मला 'बाइट' पाहिजे! 😄",
-        "चहा आनंदी का असतो? कारण तो नेहमी 'कप'मध्ये असतो! 😄"
-      ],
-      praise: ["वा! तू खूप छान आहेस! 😊", "मला खूप आनंद झाला!"],
-      scold: ["ओह… ठीक आहे, मी शांत राहतो.", "मी सुधारण्याचा प्रयत्न करेन."],
-      ask: ["आज काय बोलूया?", "तुझा दिवस कसा चाललाय?"]
-    },
-    "en-IN": {
-      greet: ["Hello! 😊", "Hi! I’m ready.", "Hey—how are you?"],
-      neutral: ["Got it. Tell me more?", "Hmm… okay. What next?", "Alright 😊"],
-      joke: ["Joke time: My computer wanted a snack—so I gave it a byte 😄"],
-      praise: ["Aww! That made me happy 😊", "Yay! Thank you!"],
-      scold: ["Okay… I’ll be calm.", "I’ll try to do better."],
-      ask: ["What should we talk about today?", "How’s your day going?"]
-    }
-  };
-
-  function pick(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
-
-  function brainReply(userText) {
-    const t = normalize(userText);
-    const p = packs[state.lang] || packs["en-IN"];
-
-    let reply = pick(p.neutral);
-    let mood = state.mood;
-    let delta = 0;
-
-    const isGreet = /(^|\s)(hi|hello|hey|namaste|नमस्ते|हॅलो|नमस्कार)(\s|$)/i.test(userText);
-    const wantsJoke = /joke|चुटकुला|विनोद|फनी|हसव/i.test(userText);
-    const praise = /good|nice|cute|love you|great|शाबाश|चांगला|छान|मस्त|भारी|अच्छा/i.test(userText);
-    const scold = /bad|stupid|idiot|shut up|बकवास|चुप|वेडा|मुर्ख/i.test(userText);
-
-    if (isGreet) {
-      reply = pick(p.greet) + " " + pick(p.ask);
-      mood = "curious";
-      delta = +2;
-    } else if (wantsJoke) {
-      reply = pick(p.joke);
-      mood = "playful";
-      delta = +4;
-    } else if (praise) {
-      reply = pick(p.praise) + " " + pick(p.ask);
-      mood = "happy";
-      delta = +5;
-    } else if (scold) {
-      reply = pick(p.scold);
-      mood = "annoyed";
-      delta = -3;
+    // apply emotion overlay
+    if (["happy","curious","annoyed","surprised","sad","sleepy"].includes(emo)) {
+      setOverlay(emo, 3.0);
     } else {
-      // Default: keep conversation going
-      reply = pick(p.neutral) + " " + pick(p.ask);
-      mood = (state.happiness < 40) ? "sleepy" : "calm";
-      delta = +1;
+      setOverlay("happy", 1.2);
     }
 
-    return { reply, mood, delta };
+    // boredom reduces after interaction
+    state.boredom = clamp(state.boredom - 0.25, 0, 1);
+
+    // speak
+    speak(text);
+
+  } catch (err) {
+    setStatus("error");
+    setOverlay("sad", 2.0);
+    setTimeout(() => setStatus("idle"), 1200);
+    speak("Sorry—my brain is not reachable right now.");
   }
-
-  // --- Eyes renderer ---
-  const canvas = document.getElementById("eyes");
-  const ctx = canvas.getContext("2d");
-  let blink = 0; // 0=open, 1=closed
-  let pupilShift = 0;
-
-  function drawEyes() {
-    const w = canvas.width, h = canvas.height;
-    ctx.clearRect(0,0,w,h);
-
-    // base positions
-    const left = {x: w*0.33, y: h*0.5};
-    const right= {x: w*0.67, y: h*0.5};
-    const r = 55;
-
-    // mood parameters
-    let lid = 0;  // 0 fully open, 1 mostly closed
-    let angry = 0;
-    let wide = 0;
-    if (state.mood === "sleepy") lid = 0.55;
-    if (state.mood === "annoyed") { lid = 0.35; angry = 0.35; }
-    if (state.mood === "curious") wide = 0.20;
-    if (state.mood === "happy") lid = 0.12;
-
-    // blink influence
-    const lidExtra = blink * 0.9;
-    const openness = Math.max(0.05, 1 - (lid + lidExtra));
-
-    function eye(pos) {
-      // outer eye
-      ctx.fillStyle = "#e8eefc";
-      ctx.beginPath(); ctx.arc(pos.x,pos.y,r*(1+wide*0.15),0,Math.PI*2); ctx.fill();
-
-      // pupil
-      const px = pos.x + pupilShift*10;
-      const py = pos.y + (state.mood==="sleepy"?10:0);
-      ctx.fillStyle = "#0b1020";
-      ctx.beginPath(); ctx.arc(px,py,18,0,Math.PI*2); ctx.fill();
-
-      // shine
-      ctx.fillStyle = "#ffffff";
-      ctx.beginPath(); ctx.arc(px-6,py-6,4,0,Math.PI*2); ctx.fill();
-
-      // eyelid overlay (simulate opening)
-      ctx.fillStyle = "#0b1020";
-      const cover = (1 - openness) * (r*2);
-      ctx.fillRect(pos.x - r - 2, pos.y - r - 2, r*2 + 4, cover);
-
-      // annoyed eyebrow line
-      if (angry > 0) {
-        ctx.strokeStyle = "#e8eefc";
-        ctx.lineWidth = 4;
-        ctx.beginPath();
-        ctx.moveTo(pos.x - r*0.8, pos.y - r*0.9);
-        ctx.lineTo(pos.x + r*0.8, pos.y - r*(0.9 + angry*0.4));
-        ctx.stroke();
-      }
-    }
-
-    eye(left);
-    eye(right);
-  }
-
-  // Blink loop
-  setInterval(() => {
-    // random blink
-    blink = 1;
-    setTimeout(()=>{ blink = 0; }, 140);
-  }, 4200);
-
-  // Small pupil motion while speaking
-  setInterval(() => {
-    pupilShift = (Math.random()*2 - 1);
-  }, 900);
-
-  // Render loop
-  setInterval(() => drawEyes(), 60);
-
-  // --- Events ---
-  saveBtn.onclick = () => {
-    state.petName = (petNameInput.value || "RoboPet").trim();
-    state.lang = langSel.value;
-    persist();
-    renderHeader();
-    renderHistory();
-    speak(state.lang === "hi-IN" ? "सेट हो गया!" : state.lang === "mr-IN" ? "सेट झाले!" : "Saved!");
-  };
-
-  function addMsg(role, text){
-    state.history.push({role, text});
-    state.history = state.history.slice(-12);
-    persist();
-    renderHistory();
-  }
-
-  sendBtn.onclick = () => {
-    const userText = (textInput.value || "").trim();
-    if (!userText) return;
-    textInput.value = "";
-    addMsg("user", userText);
-
-    const out = brainReply(userText);
-    state.mood = out.mood;
-    state.happiness = Math.max(0, Math.min(100, state.happiness + out.delta));
-    renderHeader();
-
-    addMsg("pet", out.reply);
-    speak(out.reply);
-  };
-
-  textInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") sendBtn.click();
-  });
-
-  // Init
-  renderHeader();
-  renderHistory();
-
-  // greet once
-  setTimeout(() => {
-    const p = packs[state.lang] || packs["en-IN"];
-    const hello = pick(p.greet);
-    addMsg("pet", hello);
-    speak(hello);
-  }, 600);
+}
 </script>
 </body>
 </html>
